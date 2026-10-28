@@ -7,6 +7,9 @@ using System;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Globalization;
+using System.Security.Cryptography;
+using System.Text;
 using Emby.Notifications;
 using MediaBrowser.Controller.Configuration;
 using MediaBrowser.Controller;
@@ -17,6 +20,11 @@ namespace Emby.Notifications.Discord
 {
     public class Notifier : IUserNotifier
     {
+        private static readonly object DeduplicationLock = new object();
+        private static readonly Dictionary<string, DateTimeOffset> RecentNotifications = new Dictionary<string, DateTimeOffset>();
+        private static readonly TimeSpan DuplicateWindow = TimeSpan.FromSeconds(5);
+        private const int MaximumTrackedNotifications = 1024;
+
         private ILogger _logger;
         private IServerApplicationHost _appHost;
         private IHttpClient _httpClient;
@@ -53,6 +61,8 @@ namespace Emby.Notifications.Discord
             options.TryGetValue("Username", out string Username);
             options.TryGetValue("MentionType", out string MentionType);
             options.TryGetValue("Url", out string Url);
+
+            var deduplicationKey = CreateDeduplicationKey(request, Url, AvatarUrl, Username, MentionType);
 
             var description = request.Description;
 
@@ -122,7 +132,103 @@ namespace Emby.Notifications.Discord
                 };
             }
 
-            await DiscordWebhookHelper.ExecuteWebhook(discordMessage, Url, _jsonSerializer, _httpClient, cancellationToken).ConfigureAwait(false);
+            if (deduplicationKey != null && IsDuplicateOrRemember(deduplicationKey))
+            {
+                _logger.Debug("Suppressing duplicate Discord notification for event " + request.Event + " at " + request.Date.ToString("O", CultureInfo.InvariantCulture));
+                return;
+            }
+
+            try
+            {
+                await DiscordWebhookHelper.ExecuteWebhook(discordMessage, Url, _jsonSerializer, _httpClient, cancellationToken).ConfigureAwait(false);
+            }
+            catch
+            {
+                if (deduplicationKey != null)
+                {
+                    ForgetNotification(deduplicationKey);
+                }
+
+                throw;
+            }
+        }
+
+        private static string CreateDeduplicationKey(InternalNotificationRequest request, string webhookUrl, string avatarUrl, string username, string mentionType)
+        {
+            if (request == null || string.IsNullOrWhiteSpace(webhookUrl) || string.IsNullOrWhiteSpace(request.Event) || request.Date == default(DateTimeOffset))
+            {
+                return null;
+            }
+
+            var identity = string.Join("\n", new[]
+            {
+                webhookUrl,
+                request.Event,
+                request.Date.UtcDateTime.Ticks.ToString(CultureInfo.InvariantCulture),
+                request.Server?.Name ?? string.Empty,
+                request.Title ?? string.Empty,
+                request.Description ?? string.Empty,
+                avatarUrl ?? string.Empty,
+                username ?? string.Empty,
+                mentionType ?? string.Empty
+            });
+
+            using (var sha256 = SHA256.Create())
+            {
+                return Convert.ToBase64String(sha256.ComputeHash(Encoding.UTF8.GetBytes(identity)));
+            }
+        }
+
+        private static bool IsDuplicateOrRemember(string key)
+        {
+            var now = DateTimeOffset.UtcNow;
+
+            lock (DeduplicationLock)
+            {
+                if (RecentNotifications.TryGetValue(key, out var previousTime) && now - previousTime < DuplicateWindow)
+                {
+                    return true;
+                }
+
+                RecentNotifications[key] = now;
+
+                if (RecentNotifications.Count > MaximumTrackedNotifications)
+                {
+                    var expiredKeys = RecentNotifications
+                        .Where(entry => now - entry.Value >= DuplicateWindow)
+                        .Select(entry => entry.Key)
+                        .ToArray();
+
+                    foreach (var expiredKey in expiredKeys)
+                    {
+                        RecentNotifications.Remove(expiredKey);
+                    }
+
+                    if (RecentNotifications.Count > MaximumTrackedNotifications)
+                    {
+                        var oldestKeys = RecentNotifications
+                            .OrderBy(entry => entry.Value)
+                            .Take(RecentNotifications.Count - MaximumTrackedNotifications)
+                            .Select(entry => entry.Key)
+                            .ToArray();
+
+                        foreach (var oldestKey in oldestKeys)
+                        {
+                            RecentNotifications.Remove(oldestKey);
+                        }
+                    }
+                }
+
+                return false;
+            }
+        }
+
+        private static void ForgetNotification(string key)
+        {
+            lock (DeduplicationLock)
+            {
+                RecentNotifications.Remove(key);
+            }
         }
     }
 }

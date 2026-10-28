@@ -105,6 +105,11 @@ ClientBin
 *.dbmdl
 Generated_Code #added for RIA/Silverlight projects
 
+# Local Emby diagnostics may contain private addresses and webhook URLs.
+embyserver*.txt
+hardware_detection*.txt
+artifacts/
+
 # Backup & report files from converting an old project file to a newer
 # Visual Studio version. Backup files are not needed, because we have git ;-)
 _UpgradeReport_Files/
